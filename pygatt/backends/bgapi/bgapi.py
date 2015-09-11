@@ -321,6 +321,8 @@ class BGAPIBackend(BLEBackend):
         """
         log.debug("Disconnecting")
 
+	if self._ser is None:
+		return
         self._lib.send_command(
             self._ser,
             CommandBuilder.connection_disconnect(self._connection_handle))
@@ -449,7 +451,7 @@ class BGAPIBackend(BLEBackend):
         _, response = self.expect(ResponsePacketType.connection_get_rssi)
         return response['rssi']
 
-    def run(self):
+    def start(self):
         """
         Put the interface into a known state to start. And start the recvr
         thread.
@@ -599,7 +601,7 @@ class BGAPIBackend(BLEBackend):
 
         Raises NotConnectedError on failure if check_if_connected == True.
         """
-        if not self._connected:
+        if self._ser is None or not self._connected:
             log.warn("Unexpectedly not connected")
             raise NotConnectedError()
 
