@@ -29,7 +29,6 @@ class DBusBackend(BLEBackend):
         self._lock = threading.Lock()
         self._devices = {}
         self._callbacks = {}
-        self._num_threads_running = 0
         self._match_device_name = None
 
         self._dbus_loop = dbus.mainloop.glib.DBusGMainLoop(set_as_default = True)
@@ -42,12 +41,14 @@ class DBusBackend(BLEBackend):
         self._mainloop.start()
 
     def stop(self):
+        self._dbus_loop.quit()
         self._mainloop.kill()
 
     def scan(self, timeout=10, min_devices=0, device_name=None):
         adapter = None
+
         manager = dbus.Interface(self._bus.get_object("org.bluez", "/"),
-				"org.freedesktop.DBus.ObjectManager")
+	                "org.freedesktop.DBus.ObjectManager")
         objects = manager.GetManagedObjects()
         for path, ifaces in objects.iteritems():
             adapter = ifaces.get("org.bluez.Adapter1")
@@ -68,18 +69,7 @@ class DBusBackend(BLEBackend):
         if device_name is not None:
             self._match_device_name = re.compile(".*" + device_name + ".*")
 
-        adapter_intf.SetDiscoveryFilter({"Transport": "le"})
-        adapter_intf.StartDiscovery()
-
-        start_time = pytz.utc.localize(datetime.datetime.utcnow())
-
-        for path, ifaces in objects.iteritems():
-            device = ifaces.get("org.bluez.Device1")
-            if device is not None:
-                log.debug("Adding " + str(path) + " to device list")
-                self._add_device(path)
-                log.debug("Added " + str(path) + " to device list")
-
+        log.info("Starting discovery")
         self._bus.add_signal_receiver(self._adapters_added,
             signal_name = "InterfacesAdded")
 
@@ -92,6 +82,19 @@ class DBusBackend(BLEBackend):
             signal_name = "PropertiesChanged",
             arg0 = "org.bluez.Adapter1",
             path_keyword = "path")
+
+        adapter_intf.SetDiscoveryFilter({"Transport": "le"})
+        adapter_intf.StartDiscovery()
+
+        start_time = pytz.utc.localize(datetime.datetime.utcnow())
+
+        log.debug("Checking currently known devices")
+        for path, ifaces in objects.iteritems():
+            device = ifaces.get("org.bluez.Device1")
+            if device is not None:
+                log.debug("Adding " + str(path) + " to device list")
+                self._add_device(path)
+                log.debug("Added " + str(path) + " to device list")
 
         if timeout is not None and min_devices == 0:
             log.debug("Using timeout to cancel scan")
@@ -106,14 +109,28 @@ class DBusBackend(BLEBackend):
             log.debug("Using minimum of " + str(min_devices) + " to cancel scan")
             #Wait until enough devices are discovered
             while len(self._devices) < min_devices:
+                log.debug("Sleeping for " + str(self._connect_timeout) + " seconds because " + str(len(self._devices)) + " out of " + str(min_devices) + " devices have been found")
                 time.sleep(self._connect_timeout)
         adapter_intf.StopDiscovery()
+
+        self._bus.remove_signal_receiver(self._adapters_added,
+            signal_name = "InterfacesAdded")
+
+        self._bus.remove_signal_receiver(self._properties_changed,
+            signal_name = "PropertiesChanged",
+            arg0 = "org.bluez.Device1",
+            path_keyword = "path")
+
+        self._bus.remove_signal_receiver(self._properties_changed,
+            signal_name = "PropertiesChanged",
+            arg0 = "org.bluez.Adapter1",
+            path_keyword = "path")
+
 
         #Wait for all discovery threads to finish
         self._lock.acquire()
         retval = [device for device in self._devices.values()]
         self._lock.release()
-        self._match_device_name = None
         log.debug("Scan returning " + str(retval))
         return retval
 
@@ -193,110 +210,88 @@ class DBusBackend(BLEBackend):
 
         char_iface.StartNotify()
 
-    def _add_device(self, path):
-        self._num_threads_running += 1
+    def _add_device(self, dev_path):
         self._lock.acquire(False)
 
-        device = self._bus.get_object("org.bluez", path)
+        device = self._bus.get_object("org.bluez", dev_path)
         props_iface = dbus.Interface(device, "org.freedesktop.DBus.Properties")
         try:
             address = props_iface.Get("org.bluez.Device1", "Address")
         except DBusException as e:
-            log.warn("Device " + str(path) + " does not have an address")
-            self._num_threads_running -= 1
-            if self._num_threads_running == 0:
-                try:
-                    self._lock.release()
-                except ThreadError as e:
-                    pass
+            log.warn("Device " + str(dev_path) + " does not have an address")
+            try:
+                self._lock.release()
+            except ThreadError as e:
+                pass
             return
 
         try:
             name = props_iface.Get("org.bluez.Device1", "Name")
         except DBusException as e:
             log.warn("Device " + str(address) + " does not have a name")
-            self._num_threads_running -= 1
-            if self._num_threads_running == 0:
-                try:
-                    self._lock.release()
-                except ThreadError as e:
-                    pass
+            try:
+                self._lock.release()
+            except ThreadError as e:
+                pass
             return
 
         if self._match_device_name is not None:
             if self._match_device_name.match(name) is None:
                 log.info("Ignoring device name " + name + " from " + address)
-                self._lock.relese()
+                self._lock.release()
                 return
         #Ignore if we already have a record of the device
         if address in self._devices:
             log.debug("Already have a record of " + address)
-            self._num_threads_running -= 1
-            if self._num_threads_running == 0:
-                try:
-                    self._lock.release()
-                except ThreadError as e:
-                    pass
+            try:
+                self._lock.release()
+            except ThreadError as e:
+                pass
             return
 
         #See if we already have GATT services
         gatt_services = None
         try:
             device.Connect(dbus_interface="org.bluez.Device1")
-            log.debug("Connected to " + str(path))
         except DBusException as e:
-            log.warn("Could not connect to " + str(path) + " - already connected?")
+            log.warn("Could not connect to " + str(dev_path) + " - already connected?")
 
         characteristics = {}
-        try:
-            device_iface = dbus.Interface(device, "org.freedesktop.DBus.Properties")
-            gatt_services = device_iface.Get("org.bluez.Device1", "GattServices")
-        except DBusException as e:
-            log.debug("Device " + address + " doesn't have any GATT services declared yet. " + str(e))
+        manager = dbus.Interface(self._bus.get_object("org.bluez", "/"),
+	                "org.freedesktop.DBus.ObjectManager")
+        objects = manager.GetManagedObjects()
 
-            #Wait for GATT characteristics to be populated
+        for path, interfaces in objects.items():
+            if ('org.bluez.GattCharacteristic1' not in interfaces.keys() or dev_path not in path):
+                continue
+            characteristics[interfaces["org.bluez.GattCharacteristic1"]["UUID"]] = \
+              self._bus.get_object("org.bluez", path)
+
+        if not characteristics:
+            log.info("Device " + address + " doesn't have any GATT services declared yet. ")
             time.sleep(self._connect_timeout)
-
-            #Get all characteristics
+            device.Disconnect(dbus_interface="org.bluez.Device1")
             try:
-                gatt_services = device_iface.Get("org.bluez.Device1", "GattServices")
-            except DBusException as e:
-                log.debug("Device " + address + " doesn't have any GATT services. " + str(e))
-                self._num_threads_running -= 1
-                if self._num_threads_running == 0:
-                    try:
-                        self._lock.release()
-                    except ThreadError as e:
-                        pass
-                return
+                self._lock.release()
+            except ThreadError as e:
+                pass
+            return
 
         device.Disconnect(dbus_interface="org.bluez.Device1")
-
-        for gatt_service in gatt_services:
-            service = self._bus.get_object("org.bluez", gatt_service)
-            service_iface = dbus.Interface(service, "org.freedesktop.DBus.Properties")
-            service_chars = service_iface.Get("org.bluez.GattService1", "Characteristics")
-            for service_char in service_chars:
-                char = self._bus.get_object("org.bluez", service_char)
-                char_iface = dbus.Interface(char, "org.freedesktop.DBus.Properties")
-                char_uuid = char_iface.Get("org.bluez.GattCharacteristic1", "UUID")
-                characteristics[char_uuid] = char
 
         log.info("Discovered %s: %s", address, name)
         self._devices[address] = {
             "address": address,
             "name": name,
-            "path": path,
+            "path": dev_path,
             "connected": False
         }
 
         self._devices[address]["characteristics"] = characteristics
-        self._num_threads_running -= 1
-        if self._num_threads_running == 0:
-            try:
-                self._lock.release()
-            except ThreadError as e:
-                pass
+        try:
+            self._lock.release()
+        except ThreadError as e:
+            pass
 
     def _adapters_added(self, path, interfaces):
         if "org.bluez.Device1" in interfaces:
@@ -308,7 +303,7 @@ class DBusBackend(BLEBackend):
         if interface == "org.bluez.Adapter1" and "Discovering" in changed and changed["Discovering"] == False:
             log.debug("Stop discovering")
 
-        if "RSSI" in changed:
+        if len(changed) == 1 and "RSSI" in changed:
             return
 
         log.debug("Changed: " + str(interface) + ": " + str(changed))
@@ -327,7 +322,7 @@ class DBusBackend(BLEBackend):
         if interface != "org.bluez.Device1":
             return
 
-        if "GattServices" in changed:
+        if "ServicesResolved" in changed:
             self._add_device(path)
 
     def _handle_callbacks(self, *args, **kwargs):
@@ -360,7 +355,6 @@ class DBusBackendThread(threading.Thread):
         context = self._mainloop.get_context()
         while not self._kill:
             context.iteration(True)
-
 class DBusBluetoothLEDevice(BluetoothLEDevice):
     """Have to use a subclass because the standard class assumes only one device per backend"""
     def __init__(self, mac_address, backend):
